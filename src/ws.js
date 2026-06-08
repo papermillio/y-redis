@@ -12,6 +12,34 @@ import { createSubscriber } from './subscriber.js'
 const log = logging.createModuleLogger('@y/redis/ws')
 
 /**
+ * Deadline for `client.getDoc()` inside the WS open handler. Generous for a
+ * normal Firestore-backed read (~50 ms observed) but well under Cloud Run's
+ * WS idle timeout, so a hang lands here as a rejection — surfaced by the
+ * catch in `open` — instead of as a silent stalled connection.
+ */
+const OPEN_GET_DOC_TIMEOUT_MS = 10_000
+
+/**
+ * Races `p` against a timer that rejects with `<label> timed out after Nms`.
+ * The timer is always cleared via `.finally`, so a winning `p` does not leave
+ * a setTimeout dangling on the event loop.
+ *
+ * @template T
+ * @param {Promise<T>} p
+ * @param {number} ms
+ * @param {string} label
+ * @returns {Promise<T>}
+ */
+const withTimeout = (p, ms, label) => {
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+  })
+  return Promise.race([p, deadline]).finally(() => clearTimeout(timer))
+}
+
+/**
  * how to sync
  *   receive sync-step 1
  *   // @todo y-websocket should only accept updates after receiving sync-step 2
@@ -144,27 +172,78 @@ export const registerYWebsocketServer = async (app, pattern, store, checkAuth, {
     },
     open: async (ws) => {
       const user = ws.getUserData()
+      // Entry log (always-on, unlike the lib0 `log()` below) so a hang on the
+      // FIRST step of the handler is still distinguishable from "open never
+      // ran" in the request stream.
+      console.info(`[y-redis ws.open] start room="${user.room}" uid=${user.id}`)
       log(() => ['client connected (uid=', user.id, ', ip=', Buffer.from(ws.getRemoteAddressAsText()).toString(), ')'])
       const stream = api.computeRedisRoomStreamName(user.room, 'index', redisPrefix)
-      user.subs.add(stream)
-      ws.subscribe(stream)
-      user.initialRedisSubId = subscriber.subscribe(stream, redisMessageSubscriber).redisId
-      const indexDoc = await client.getDoc(user.room, 'index')
-      if (indexDoc.ydoc.store.clients.size === 0) {
-        initDocCallback(user.room, 'index', client)
-      }
-      if (user.isClosed) return
-      ws.cork(() => {
-        ws.send(protocol.encodeSyncStep1(Y.encodeStateVector(indexDoc.ydoc)), true, false)
-        ws.send(protocol.encodeSyncStep2(Y.encodeStateAsUpdate(indexDoc.ydoc)), true, true)
-        if (indexDoc.awareness.states.size > 0) {
-          ws.send(protocol.encodeAwarenessUpdate(indexDoc.awareness, array.from(indexDoc.awareness.states.keys())), true, true)
+      // uWS does not await the async open callback, so a throw inside the
+      // body lands as an unhandled rejection on Node's microtask queue —
+      // invisible without a global listener, and on some configurations
+      // silently dropped. Wrap the whole body so the room context reaches
+      // the logs synchronously; otherwise a per-room failure (e.g. a Yjs
+      // decode throw inside getDoc/applyUpdateV2, or a downstream encode)
+      // shows up at the load balancer as a 502 with no server-side trace.
+      //
+      // Chain-of-progress `console.info` calls flag each step's exit so the
+      // last line before silence names the hang site — necessary because an
+      // unsettled await (a Firestore `.get()` that never resolves, a Yjs
+      // decode infinite-looping) cannot be caught by this try/catch.
+      try {
+        user.subs.add(stream)
+        ws.subscribe(stream)
+        console.info(`[y-redis ws.open] subscribed room="${user.room}"`)
+        user.initialRedisSubId = subscriber.subscribe(stream, redisMessageSubscriber).redisId
+        console.info(`[y-redis ws.open] redis-sub-ok room="${user.room}"`)
+        // Race the async getDoc against a 10s deadline so an unsettled
+        // promise (the suspected hang on `financials` / `contents-footer`)
+        // is converted into a rejection that the catch below can pick up.
+        // 10s is generous for a normal Firestore read (sub-100ms in
+        // observed traces) and well under Cloud Run's WS idle timeout.
+        const indexDoc = await withTimeout(client.getDoc(user.room, 'index'), OPEN_GET_DOC_TIMEOUT_MS, 'client.getDoc')
+        console.info(`[y-redis ws.open] getDoc-ok room="${user.room}" hasContent=${indexDoc.ydoc.store.clients.size > 0}`)
+        if (indexDoc.ydoc.store.clients.size === 0) {
+          initDocCallback(user.room, 'index', client)
         }
-      })
-      if (api.isSmallerRedisId(indexDoc.redisLastId, user.initialRedisSubId)) {
-        // our subscription is newer than the content that we received from the api
-        // need to renew subscription id and make sure that we catch the latest content.
-        subscriber.ensureSubId(stream, indexDoc.redisLastId)
+        if (user.isClosed) {
+          // The close callback ran while we were awaiting getDoc — surface
+          // the silent return path so a `closed-before-send` line names the
+          // race that aborts this open. The matching `[y-redis ws.close]`
+          // line emitted by the close callback below pairs uid-wise.
+          console.info(`[y-redis ws.open] closed-before-send room="${user.room}" uid=${user.id}`)
+          return
+        }
+        ws.cork(() => {
+          ws.send(protocol.encodeSyncStep1(Y.encodeStateVector(indexDoc.ydoc)), true, false)
+          ws.send(protocol.encodeSyncStep2(Y.encodeStateAsUpdate(indexDoc.ydoc)), true, true)
+          if (indexDoc.awareness.states.size > 0) {
+            ws.send(protocol.encodeAwarenessUpdate(indexDoc.awareness, array.from(indexDoc.awareness.states.keys())), true, true)
+          }
+        })
+        console.info(`[y-redis ws.open] sent-sync room="${user.room}"`)
+        if (api.isSmallerRedisId(indexDoc.redisLastId, user.initialRedisSubId)) {
+          // our subscription is newer than the content that we received from the api
+          // need to renew subscription id and make sure that we catch the latest content.
+          subscriber.ensureSubId(stream, indexDoc.redisLastId)
+        }
+        console.info(`[y-redis ws.open] done room="${user.room}"`)
+      } catch (err) {
+        // Narrow at the boundary: strict tsc + allowJs/checkJs would treat
+        // `err` as `{}` and reject any property access without a guard.
+        if (err instanceof Error) {
+          console.error(`[y-redis ws.open] FAILED room="${user.room}" uid=${user.id} err=${err.message}`)
+          if (err.stack) console.error(err.stack)
+        } else {
+          console.error(`[y-redis ws.open] FAILED room="${user.room}" uid=${user.id} err=${String(err)}`)
+        }
+        // Close the WS so the client and the load balancer see a clean
+        // termination instead of a stalled half-open connection. Best-effort
+        // — if `ws` is already torn down `end` throws and we have nothing
+        // useful to do with that second error.
+        try {
+          ws.end(1011, 'open handler error')
+        } catch (_) {}
       }
     },
     message: (ws, messageBuffer) => {
@@ -199,6 +278,13 @@ export const registerYWebsocketServer = async (app, pattern, store, checkAuth, {
     },
     close: (ws, code, message) => {
       const user = ws.getUserData()
+      // Always-on close log so we can pair a `closed-before-send` open-handler
+      // line with the close code that triggered it (1000=normal client, 1001=
+      // going away, 1006=abnormal/no close frame typical of proxy drops,
+      // 1011=our own ws.end on open-handler error). The lib0 `log()` below
+      // is gated on a runtime level and silent in production.
+      const reason = message && message.byteLength ? Buffer.from(message).toString() : ''
+      console.info(`[y-redis ws.close] room="${user.room}" uid=${user.id} code=${code}${reason ? ` reason="${reason}"` : ''}`)
       user.awarenessId && client.addMessage(user.room, 'index', Buffer.from(protocol.encodeAwarenessUserDisconnected(user.awarenessId, user.awarenessLastClock)))
       user.isClosed = true
       log(() => ['client connection closed (uid=', user.id, ', code=', code, ', message="', Buffer.from(message).toString(), '")'])

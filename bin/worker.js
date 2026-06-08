@@ -41,7 +41,12 @@ const updateCallback = async (room, ydoc) => {
     // call YDOC_UPDATE_CALLBACK here
     const formData = new FormData()
     // @todo only convert ydoc to updatev2 once
-    formData.append('ydoc', new Blob([Y.encodeStateAsUpdateV2(ydoc)]))
+    // `Uint8Array<ArrayBufferLike>` is a valid BlobPart at runtime, but strict
+    // tsc narrows ArrayBufferLike to ArrayBuffer | SharedArrayBuffer and rejects
+    // the latter as a BlobPart shape. Cast via a binding to keep `standard`'s
+    // array-bracket rule happy. (Pre-existing under newer @types/node / typescript.)
+    const update = /** @type {BlobPart} */ (Y.encodeStateAsUpdateV2(ydoc))
+    formData.append('ydoc', new Blob([update]))
     // @todo should add a timeout to fetch (see fetch signal abortcontroller)
     const res = await fetch(new URL(room, ydocUpdateCallback), { body: formData, method: 'PUT' })
     if (!res.ok) {

@@ -46,6 +46,13 @@ export const createYWebsocketServer = async ({
   const app = uws.App({})
   await registerYWebsocketServer(app, '/:room', store, async (req) => {
     const room = req.getParameter(0)
+    // Newer uWS types declare getParameter(idx) as `string | undefined` even
+    // when the pattern guarantees the segment exists. Surface an explicit
+    // error rather than letting `undefined` propagate through the room
+    // string into the perm callback and the Redis stream name.
+    if (room == null) {
+      throw new Error('Missing :room URL segment')
+    }
     const headerWsProtocol = req.getHeader('sec-websocket-protocol')
     const [, , token] = /(^|,)yauth-(((?!,).)*)/.exec(headerWsProtocol) ?? [null, null, req.getQuery('yauth')]
     if (token == null) {
